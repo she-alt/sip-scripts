@@ -13,7 +13,7 @@ import argparse
 '''
 
 # Define the SIP server and port
-SIP_SERVER = 'sip.sinch.com' 
+SIP_SERVER = '<server uri>' 
 SIP_PORT = 5060
 
 # Request interval, time to wait between requests
