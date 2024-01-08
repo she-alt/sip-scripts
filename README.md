@@ -1,2 +1,1 @@
-# python
-Python code 
+Collection of tools/scripts for SIP
