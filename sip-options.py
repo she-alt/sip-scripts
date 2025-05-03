@@ -19,11 +19,6 @@ SIP_PORT = 5060
 # Request interval, time to wait between requests
 REQUEST_INTERVAL = 1
 
-# Define the number of requests to send
-NUM_REQUESTS = 5
-
-# Define socket recieve timeout
-SOCK_TIMEOUT = 5
 
 # SIP OPTIONS request template
 OPTIONS_TEMPLATE = (
@@ -101,7 +96,13 @@ async def main():
     total_sent_requests = 0
     total_successful_responses = 0
     total_failed_responses = 0
+    
+    # Define the number of requests to send
+    NUM_REQUESTS = 5
 
+    # Define socket recieve timeout
+    SOCK_TIMEOUT = 5
+    
     # total arguments
     n = len(sys.argv)
     if not len(sys.argv) >= 1:
@@ -114,17 +115,23 @@ async def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("destination", help="URI/IP of the SIP device to send SIP Option")
-    #parser.add_argument("--t", "--timeout", action="store_true", help="socket timeout in seconds")
+    parser.add_argument("-c", "--count", type=int, help="Number of requests to send")
+    parser.add_argument("-t", "--timeout", type=float, help="Socket timeout in seconds")
     args = parser.parse_args()
-    config = vars(args)
-
+    
     if args.destination:
         SIP_SERVER = args.destination
-
+    
+    if args.timeout:
+        SOCK_TIMEOUT = args.timeout
+    
+    if args.count:
+        NUM_REQUESTS = args.count
+    
     rtt_list = []
-
-    print(f"Sending SIP OPTION request to {SIP_SERVER}")
-
+    
+    print(f"Sending SIP OPTION request to {SIP_SERVER} with a timeout of {SOCK_TIMEOUT}, total requests to send are {NUM_REQUESTS}")
+    
     try:
         for i in range(NUM_REQUESTS):
             rtt = await send_options_request(SIP_SERVER, SIP_PORT, SOCK_TIMEOUT)
