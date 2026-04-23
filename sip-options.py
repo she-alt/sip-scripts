@@ -24,7 +24,7 @@ REQUEST_INTERVAL = 1
 OPTIONS_TEMPLATE = (
     "OPTIONS sip:{server}:{port} SIP/2.0\r\n"
     "Via: SIP/2.0/UDP {lan_ip}:{lan_port};branch=z9hG4bK4ce2.{branch};rport;alias\r\n"
-    "Max-Forwards: 70\r\n"
+    "Max-Forwards: 0\r\n"
     "To: sip:ping@{server}:{port}\r\n"
     "From: sip:ping@{server}:{port};tag=73686572617A\r\n"
     "Call-ID: {call_id}\r\n"
@@ -35,12 +35,21 @@ OPTIONS_TEMPLATE = (
     "\r\n"
 )
 
-async def send_options_request(SIP_SERVER, SIP_PORT, SOCK_TIMEOUT):
+
+
+def create_udp_socket(sock_timeout):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 0))
+    sock.settimeout(sock_timeout)
+    return sock
+
+
+async def send_options_request(sock, SIP_SERVER, SIP_PORT, SOCK_TIMEOUT):
     try:
         # Create and bind UDP socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("0.0.0.0", 0))
-        sock.settimeout(SOCK_TIMEOUT)
+        #sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        #sock.bind(("0.0.0.0", 0))
+        #sock.settimeout(SOCK_TIMEOUT)
         
         # Generate unique values for the SIP packet
         branch = cseq = str(int(time.time()))
@@ -86,9 +95,6 @@ async def send_options_request(SIP_SERVER, SIP_PORT, SOCK_TIMEOUT):
         # Generic handler
         print(f"Error sending request: {e}")
         sys.exit(1)
-            
-    finally:
-        sock.close()
 
 
 async def main():
@@ -133,8 +139,19 @@ async def main():
     print(f"Sending SIP OPTION request to {SIP_SERVER} with a timeout of {SOCK_TIMEOUT}, total requests to send are {NUM_REQUESTS}")
     
     try:
+        lan_ip = socket.gethostbyname(socket.gethostname())
+        sock = create_udp_socket(SOCK_TIMEOUT)
+    except socket.gaierror:
+        print("Error sending request: Unable to resolve hostname.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error creating socket: {e}")
+        sys.exit(1)
+    
+    
+    try:
         for i in range(NUM_REQUESTS):
-            rtt = await send_options_request(SIP_SERVER, SIP_PORT, SOCK_TIMEOUT)
+            rtt = await send_options_request(sock,SIP_SERVER, SIP_PORT, SOCK_TIMEOUT)
             if rtt is not None:
                 total_rtt += rtt
                 total_successful_responses += 1
@@ -158,6 +175,9 @@ async def main():
     except Exception as e:
         print(f'An error occurred: {e}')
         sys.exit(1)
+        
+    finally:
+        sock.close()
 
 
 if __name__ == "__main__":
