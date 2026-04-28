@@ -8,8 +8,8 @@ import signal
 
 ###
 '''
-# Sends UDP SIP options to an endpoint and shows the round-trip-time and packet loss percentage.
-# //SHAL 2024
+# Sends UDP SIP options to an endpoint and shows DNS resolution time, round-trip-time and packet loss percentage.
+# //SHAL 2026
 ###
 '''
 
@@ -23,44 +23,79 @@ REQUEST_INTERVAL = 1
 # SIP OPTIONS request template
 OPTIONS_TEMPLATE = (
     "OPTIONS sip:{server}:{port} SIP/2.0\r\n"
-    "Via: SIP/2.0/UDP {lan_ip}:{lan_port};branch=z9hG4bK4ce2.{branch};rport;alias\r\n"
-    "Max-Forwards: 0\r\n"
+    "Via: SIP/2.0/UDP {lan_ip}:{lan_port};branch=z9hG4bK{branch};rport\r\n"
+    "Max-Forwards: 70\r\n"
     "To: sip:ping@{server}:{port}\r\n"
     "From: sip:ping@{server}:{port};tag=73686572617A\r\n"
     "Call-ID: {call_id}\r\n"
     "CSeq: {cseq} OPTIONS\r\n"
-    "Contact: sip:{server}:{port}\r\n"
-    "Accept: application/sdp\r\n"
+    "Contact: sip:{lan_ip}:{lan_port}\r\n"
     "Content-Length: 0\r\n"
     "\r\n"
 )
 
 
-
-def create_udp_socket(sock_timeout):
+# Better way to get local ip. 
+def get_local_ip():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.4.4", 53))
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
+
+
+# Create and reuse one socket
+def create_socket(timeout):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
     sock.bind(("0.0.0.0", 0))
-    sock.settimeout(sock_timeout)
     return sock
 
+# Percentilr calculation
+def percentile(data, p):
+    if not data:
+        return 0
+    data = sorted(data)
+    k = (len(data) - 1) * (p / 100)
+    f = int(k)
+    c = min(f + 1, len(data) - 1)
+    if f == c:
+        return data[f]
+    return data[f] + (data[c] - data[f]) * (k - f)
 
-async def send_options_request(sock, SIP_SERVER, SIP_PORT, SOCK_TIMEOUT):
+
+# DNS resolution time calculation
+def resolve_target(host):
+    #monotonic for better results
+    start = time.monotonic()
     try:
-        # Create and bind UDP socket
-        #sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        #sock.bind(("0.0.0.0", 0))
-        #sock.settimeout(SOCK_TIMEOUT)
-        
-        # Generate unique values for the SIP packet
-        branch = cseq = str(int(time.time()))
+        ip = socket.gethostbyname(host)
+        dns_time = (time.monotonic() - start) * 1000
+        return ip, dns_time
+    except socket.gaierror:
+        return None, None
+
+
+def send_and_receive(sock, message, ip, port):
+    sock.sendto(message.encode(), (ip, port))
+    return sock.recvfrom(1024)
+
+
+async def send_options_request(sock, ip, host, port, timeout, lan_ip):
+    try:
+        loop = asyncio.get_running_loop()
+
+        now = int(time.time() * 1000)
+        branch = str(now)
         call_id = str(uuid.uuid4())
-        lan_ip = socket.gethostbyname(socket.gethostname())
+        cseq = str(now)
+
         lan_port = sock.getsockname()[1]
-        
-        # Format the SIP OPTIONS request
+
         request = OPTIONS_TEMPLATE.format(
-            server=SIP_SERVER,
-            port=SIP_PORT,
+            server=host,   # keep hostname in SIP headers
+            port=port,
             lan_ip=lan_ip,
             lan_port=lan_port,
             branch=branch,
@@ -68,133 +103,123 @@ async def send_options_request(sock, SIP_SERVER, SIP_PORT, SOCK_TIMEOUT):
             cseq=cseq
         )
 
-        # Send the request
-        start_time = time.time()
-        sock.sendto(request.encode(), (SIP_SERVER, SIP_PORT))
+        start = time.monotonic()
 
-        # Receive the response
-        response, _ = sock.recvfrom(1024)
-        end_time = time.time()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, send_and_receive, sock, request, ip, port
+                ),
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            print("Request timed out")
+            return None
+        except socket.timeout:
+            print("Socket timeout")
+            return None
 
-        # Calculate RTT
-        rtt = (end_time - start_time) * 1000  # Convert to milliseconds
-        print(f"Reply received: {rtt:.2f}ms")
-
+        rtt = (time.monotonic() - start) * 1000
+        print(f"Reply received: {rtt:.2f} ms")
         return rtt
 
-    except socket.gaierror:
-        # Indicate issue with getaddressinfo
-        print ("Error sending request: Unable to resolve hostname.")
-        sys.exit()
-    
-    except KeyboardInterrupt:
-        print("\nProgram interrupted by user. Shutting down...")
-        sys.exit()
-               
     except Exception as e:
-        # Generic handler
-        print(f"Error sending request: {e}")
-        sys.exit(1)
+        print(f"Request error: {e}")
+        return None
 
+
+# ---------- Main ----------
 
 async def main():
-    total_rtt = 0
-    total_sent_requests = 0
-    total_successful_responses = 0
-    total_failed_responses = 0
-    
-    # Define the number of requests to send
-    NUM_REQUESTS = 5
-
-    # Define socket recieve timeout
-    SOCK_TIMEOUT = 5
-    
-    # total arguments
-    n = len(sys.argv)
-    if not len(sys.argv) >= 1:
-        #SIP_SERVER = sys.argv[1]
-        print("No argument given. Destination is required")
-        sys.exit(1)
-    
     parser = argparse.ArgumentParser(
-        description="Sends UDP SIP option packet to an endpoint and shows the round-trip-time and packet loss percentage.",
+        description="Sends UDP SIP options to an endpoint and shows DNS resolution time, round-trip-time and packet loss percentage ",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("destination", help="URI/IP of the SIP device to send SIP Option")
-    parser.add_argument("-c", "--count", type=int, help="Number of requests to send")
-    parser.add_argument("-t", "--timeout", type=float, help="Socket timeout in seconds")
-    args = parser.parse_args()
-    
-    if args.destination:
-        SIP_SERVER = args.destination
-    
-    if args.timeout:
-        SOCK_TIMEOUT = args.timeout
-    
-    if args.count:
-        NUM_REQUESTS = args.count
-    
-    rtt_list = []
-    
-    print(f"Sending SIP OPTION request to {SIP_SERVER} with a timeout of {SOCK_TIMEOUT}, total requests to send are {NUM_REQUESTS}")
-    
-    try:
-        lan_ip = socket.gethostbyname(socket.gethostname())
-        sock = create_udp_socket(SOCK_TIMEOUT)
-    except socket.gaierror:
-        print("Error sending request: Unable to resolve hostname.")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error creating socket: {e}")
-        sys.exit(1)
-    
-    
-    try:
-        for i in range(NUM_REQUESTS):
-            rtt = await send_options_request(sock,SIP_SERVER, SIP_PORT, SOCK_TIMEOUT)
-            if rtt is not None:
-                total_rtt += rtt
-                total_successful_responses += 1
-                rtt_list.append(rtt)
-            else:
-                total_failed_responses += 1
-            total_sent_requests += 1
+    parser.add_argument("destination", help="SIP server IP/hostname")
+    parser.add_argument("-c", "--count", type=int, default=5)
+    parser.add_argument("-t", "--timeout", type=float, default=3)
 
-                # Ensures non-blocking sleep when running async
+    args = parser.parse_args()
+
+    host = args.destination
+    num_requests = args.count
+    timeout = args.timeout
+
+    lan_ip = get_local_ip()
+
+    # DNS resolution
+    ip, dns_time = resolve_target(host)
+
+    if ip is None:
+        print("DNS resolution failed")
+        return
+
+    sock = create_socket(timeout)
+
+    print(f"\nSending SIP Option to: {host} ({ip})")
+    print(f"DNS resolution time: {dns_time:.2f} ms")
+    #print(f"Local IP: {lan_ip}")
+    print(f"Requests: {num_requests}, Timeout: {timeout}s\n")
+
+    sent = 0
+    received = 0
+    rtt_list = []
+
+    try:
+        for _ in range(num_requests):
+            rtt = await send_options_request(sock, ip, host, SIP_PORT, timeout, lan_ip)
+
+            sent += 1
+            if rtt is not None:
+                received += 1
+                rtt_list.append(rtt)
+
             await asyncio.sleep(REQUEST_INTERVAL)
 
-        if total_sent_requests > 0:
-            average_rtt = total_rtt / total_successful_responses
-            loss_percentage = ((total_sent_requests - total_successful_responses) / total_sent_requests) * 100
-            print("\n----- Summary -----")
-            print(f"{total_sent_requests} packets sent, {total_successful_responses} received, {loss_percentage:.2f}% packet loss")
-            print(f"rtt min/max/avg: {min(rtt_list):.2f}/{max(rtt_list):.2f}/{average_rtt:.2f} ms")
-        else:
-            print("\nNo responses received.")
-
-    except Exception as e:
-        print(f'An error occurred: {e}')
-        sys.exit(1)
-        
     finally:
         sock.close()
+
+    # ---------- Summary ----------
+
+    print("\n----- Summary -----")
+
+    loss = ((sent - received) / sent) * 100 if sent else 0
+    print(f"{sent} sent, {received} received, {loss:.2f}% packet loss")
+
+    print(f"DNS resolution: {dns_time:.2f} ms")
+
+    if rtt_list:
+        avg = sum(rtt_list) / len(rtt_list)
+
+        print(f"rtt min/avg/max: {min(rtt_list):.2f}/{avg:.2f}/{max(rtt_list):.2f} ms")
+
+        print(
+            f"percentiles p50/p95/p99: "
+            f"{percentile(rtt_list,50):.2f}/"
+            f"{percentile(rtt_list,95):.2f}/"
+            f"{percentile(rtt_list,99):.2f} ms"
+        )
+    else:
+        print("No successful responses")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nProgram interrupted by user. Shutting down...")
-        sys.exit(0)
-
+        print("\nInterrupted by user")
+        
+ 
 #
 # ToDo
 # - Add customization for Options Template
 # - Add support for TCP 
-# - have commandline arguments for number of packets, timeout, template to use, help and add validation  
+# - have commandline arguments for template to use, add response validation  
 # ########################
 # - references
 # https://docs.python.org/3/library/socket.html#functions
 # https://docs.python.org/3/library/asyncio.html
 # https://docs.python.org/3/library/uuid.html
-#
+# https://docs.python.org/3/library/time.html#time.monotonic
+# https://docs.python.org/3/library/argparse.html#module-argparse
+# 
