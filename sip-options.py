@@ -34,6 +34,9 @@ OPTIONS_TEMPLATE = (
     "\r\n"
 )
 
+# Compact header forms (RFC 3261 7.3.3) we need to recognise in replies
+COMPACT_HEADERS = {"i": "call-id", "v": "via"}
+
 
 # Better way to get local ip. 
 def get_local_ip():
@@ -77,9 +80,66 @@ def resolve_target(host):
         return None, None
 
 
-def send_and_receive(sock, message, ip, port):
+# Parse a SIP response. Returns (status_code, reason, headers) or None if the
+# packet is not a SIP response (garbage, a request, wrong protocol, etc.)
+def parse_response(data):
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if not lines:
+        return None
+
+    try:
+        proto, code, reason = (lines[0].split(" ", 2) + [""])[:3]
+    except ValueError:
+        return None
+    if proto != "SIP/2.0" or not code.isdigit():
+        return None
+
+    headers = {}
+    for line in lines[1:]:
+        if not line:        # blank line = end of headers
+            break
+        if ":" in line:
+            name, value = line.split(":", 1)
+            name = name.strip().lower()
+            name = COMPACT_HEADERS.get(name, name)
+            headers.setdefault(name, value.strip())   # keep first (top) occurrence
+
+    return int(code), reason, headers
+
+
+# Does this response belong to the request we just sent?
+def matches_request(headers, call_id, cseq, branch):
+    if headers.get("call-id") != call_id:
+        return False
+    if headers.get("cseq", "").split() != [cseq, "OPTIONS"]:
+        return False
+    via_params = [p.strip() for p in headers.get("via", "").split(";")]
+    return f"branch=z9hG4bK{branch}" in via_params
+
+
+# Send the request, then keep reading until a valid final response for it arrives
+# (or the timeout expires). Stale, foreign, malformed and 1xx packets are ignored.
+def send_and_receive(sock, message, ip, port, call_id, cseq, branch, timeout):
+    deadline = time.monotonic() + timeout
     sock.sendto(message.encode(), (ip, port))
-    return sock.recvfrom(1024)
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout()
+        sock.settimeout(remaining)
+
+        data, _addr = sock.recvfrom(4096)
+
+        parsed = parse_response(data)
+        if parsed is None:
+            continue                      # not a SIP response
+        status, reason, headers = parsed
+        if not matches_request(headers, call_id, cseq, branch):
+            continue                      # late reply to an earlier request / unrelated
+        if status < 200:
+            continue                      # provisional (100 Trying etc.), wait for final
+        return status, reason
 
 
 async def send_options_request(sock, ip, host, port, timeout, lan_ip):
@@ -106,11 +166,14 @@ async def send_options_request(sock, ip, host, port, timeout, lan_ip):
         start = time.monotonic()
 
         try:
-            await asyncio.wait_for(
+            # wait_for is slightly longer than the socket deadline so the worker
+            # thread always finishes first and can't steal the next request's reply
+            status, reason = await asyncio.wait_for(
                 loop.run_in_executor(
-                    None, send_and_receive, sock, request, ip, port
+                    None, send_and_receive, sock, request, ip, port,
+                    call_id, cseq, branch, timeout
                 ),
-                timeout=timeout
+                timeout=timeout + 1
             )
         except asyncio.TimeoutError:
             print("Request timed out")
@@ -120,7 +183,7 @@ async def send_options_request(sock, ip, host, port, timeout, lan_ip):
             return None
 
         rtt = (time.monotonic() - start) * 1000
-        print(f"Reply received: {rtt:.2f} ms")
+        print(f"Reply received: {status} {reason} - {rtt:.2f} ms")
         return rtt
 
     except Exception as e:
@@ -214,7 +277,7 @@ if __name__ == "__main__":
 # ToDo
 # - Add customization for Options Template
 # - Add support for TCP 
-# - have commandline arguments for template to use, add response validation  
+# - have commandline arguments for template to use
 # ########################
 # - references
 # https://docs.python.org/3/library/socket.html#functions
