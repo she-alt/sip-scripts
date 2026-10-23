@@ -19,17 +19,22 @@ SIP_PORT = 5060
 # Request interval, time to wait between requests
 REQUEST_INTERVAL = 1
 
+# One Call-ID for the whole run; CSeq increments per request (RFC 3261 style keepalive)
+CALL_ID = str(uuid.uuid4())
+
 
 # SIP OPTIONS request template
 OPTIONS_TEMPLATE = (
     "OPTIONS sip:{server}:{port} SIP/2.0\r\n"
     "Via: SIP/2.0/UDP {lan_ip}:{lan_port};branch=z9hG4bK{branch};rport\r\n"
     "Max-Forwards: 70\r\n"
-    "To: sip:ping@{server}:{port}\r\n"
-    "From: sip:ping@{server}:{port};tag=73686572617A\r\n"
+    "To: <sip:ping@{server}:{port}>\r\n"
+    "From: <sip:ping@{server}:{port}>;tag=73686572617A\r\n"
     "Call-ID: {call_id}\r\n"
     "CSeq: {cseq} OPTIONS\r\n"
     "Contact: sip:{lan_ip}:{lan_port}\r\n"
+    "User-Agent: sip-options\r\n"
+    "Accept: application/sdp\r\n"
     "Content-Length: 0\r\n"
     "\r\n"
 )
@@ -48,11 +53,14 @@ def get_local_ip():
         sock.close()
 
 
-# Create and reuse one socket
-def create_socket(timeout):
+# Create and reuse one socket.
+# connect() on UDP: the kernel drops packets from other sources and reports
+# ICMP port-unreachable as ConnectionRefusedError/ConnectionResetError.
+# Non-blocking so asyncio can await it directly (no worker threads).
+def create_socket(ip, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
-    sock.bind(("0.0.0.0", 0))
+    sock.connect((ip, port))
+    sock.setblocking(False)
     return sock
 
 # Percentilr calculation
@@ -78,6 +86,14 @@ def resolve_target(host):
         return ip, dns_time
     except socket.gaierror:
         return None, None
+
+
+# Accepts host or host:port
+def split_host_port(dest, default_port):
+    if ":" in dest:
+        host, port = dest.rsplit(":", 1)
+        return host, int(port)
+    return dest, default_port
 
 
 # Parse a SIP response. Returns (status_code, reason, headers) or None if the
@@ -117,19 +133,15 @@ def matches_request(headers, call_id, cseq, branch):
     return f"branch=z9hG4bK{branch}" in via_params
 
 
-# Send the request, then keep reading until a valid final response for it arrives
-# (or the timeout expires). Stale, foreign, malformed and 1xx packets are ignored.
-def send_and_receive(sock, message, ip, port, call_id, cseq, branch, timeout):
-    deadline = time.monotonic() + timeout
-    sock.sendto(message.encode(), (ip, port))
+# Send the request, then keep reading until a valid final response for it arrives.
+# Stale, foreign, malformed and 1xx packets are ignored. The caller applies the
+# timeout with wait_for; cancelling this coroutine leaves nothing running behind.
+async def send_and_receive(sock, message, call_id, cseq, branch):
+    loop = asyncio.get_running_loop()
+    await loop.sock_sendall(sock, message.encode())
 
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise socket.timeout()
-        sock.settimeout(remaining)
-
-        data, _addr = sock.recvfrom(4096)
+        data = await loop.sock_recv(sock, 4096)
 
         parsed = parse_response(data)
         if parsed is None:
@@ -142,14 +154,10 @@ def send_and_receive(sock, message, ip, port, call_id, cseq, branch, timeout):
         return status, reason
 
 
-async def send_options_request(sock, ip, host, port, timeout, lan_ip):
+async def send_options_request(sock, host, port, timeout, lan_ip, seq):
     try:
-        loop = asyncio.get_running_loop()
-
-        now = int(time.time() * 1000)
-        branch = str(now)
-        call_id = str(uuid.uuid4())
-        cseq = str(now)
+        branch = uuid.uuid4().hex[:16]
+        cseq = str(seq)
 
         lan_port = sock.getsockname()[1]
 
@@ -159,27 +167,22 @@ async def send_options_request(sock, ip, host, port, timeout, lan_ip):
             lan_ip=lan_ip,
             lan_port=lan_port,
             branch=branch,
-            call_id=call_id,
+            call_id=CALL_ID,
             cseq=cseq
         )
 
         start = time.monotonic()
 
         try:
-            # wait_for is slightly longer than the socket deadline so the worker
-            # thread always finishes first and can't steal the next request's reply
             status, reason = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, send_and_receive, sock, request, ip, port,
-                    call_id, cseq, branch, timeout
-                ),
-                timeout=timeout + 1
+                send_and_receive(sock, request, CALL_ID, cseq, branch),
+                timeout=timeout
             )
         except asyncio.TimeoutError:
             print("Request timed out")
             return None
-        except socket.timeout:
-            print("Socket timeout")
+        except ConnectionError:
+            print("Port unreachable (ICMP error)")
             return None
 
         rtt = (time.monotonic() - start) * 1000
@@ -198,13 +201,19 @@ async def main():
         description="Sends UDP SIP options to an endpoint and shows DNS resolution time, round-trip-time and packet loss percentage ",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("destination", help="SIP server IP/hostname")
+    parser.add_argument("destination", help="SIP server IP/hostname, optionally host:port")
+    parser.add_argument("-p", "--port", type=int, default=SIP_PORT)
     parser.add_argument("-c", "--count", type=int, default=5)
     parser.add_argument("-t", "--timeout", type=float, default=3)
+    parser.add_argument("-i", "--interval", type=float, default=REQUEST_INTERVAL)
 
     args = parser.parse_args()
 
-    host = args.destination
+    try:
+        host, port = split_host_port(args.destination, args.port)
+    except ValueError:
+        parser.error(f"invalid destination: {args.destination}")
+
     num_requests = args.count
     timeout = args.timeout
 
@@ -217,9 +226,13 @@ async def main():
         print("DNS resolution failed")
         return
 
-    sock = create_socket(timeout)
+    try:
+        sock = create_socket(ip, port)
+    except OSError as e:
+        print(f"Socket error: {e}")
+        return
 
-    print(f"\nSending SIP Option to: {host} ({ip})")
+    print(f"\nSending SIP Option to: {host} ({ip}), port {port}")
     print(f"DNS resolution time: {dns_time:.2f} ms")
     #print(f"Local IP: {lan_ip}")
     print(f"Requests: {num_requests}, Timeout: {timeout}s\n")
@@ -229,16 +242,20 @@ async def main():
     rtt_list = []
 
     try:
-        for _ in range(num_requests):
-            rtt = await send_options_request(sock, ip, host, SIP_PORT, timeout, lan_ip)
+        for seq in range(1, num_requests + 1):
+            start = time.monotonic()
+            rtt = await send_options_request(sock, host, port, timeout, lan_ip, seq)
 
             sent += 1
             if rtt is not None:
                 received += 1
                 rtt_list.append(rtt)
 
-            await asyncio.sleep(REQUEST_INTERVAL)
+            # sleep only for what is left of the interval so the cadence doesn't drift
+            await asyncio.sleep(max(0, args.interval - (time.monotonic() - start)))
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nInterrupted")      # fall through to the summary, like ping
     finally:
         sock.close()
 
