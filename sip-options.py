@@ -133,28 +133,44 @@ def matches_request(headers, call_id, cseq, branch):
     return f"branch=z9hG4bK{branch}" in via_params
 
 
+# Verbose output: print a raw SIP message, indented
+def dump(label, text):
+    print(label)
+    for line in text.rstrip().splitlines():
+        print(f"    {line}")
+    print()
+
+
 # Send the request, then keep reading until a valid final response for it arrives.
 # Stale, foreign, malformed and 1xx packets are ignored. The caller applies the
 # timeout with wait_for; cancelling this coroutine leaves nothing running behind.
-async def send_and_receive(sock, message, call_id, cseq, branch):
+async def send_and_receive(sock, message, call_id, cseq, branch, verbose=False):
     loop = asyncio.get_running_loop()
     await loop.sock_sendall(sock, message.encode())
+    if verbose:
+        dump(">>> Request sent", message)
 
     while True:
         data = await loop.sock_recv(sock, 4096)
 
         parsed = parse_response(data)
         if parsed is None:
+            if verbose:
+                print(f"<<< Ignored: not a SIP response ({len(data)} bytes)\n")
             continue                      # not a SIP response
         status, reason, headers = parsed
         if not matches_request(headers, call_id, cseq, branch):
+            if verbose:
+                print(f"<<< Ignored: {status} {reason} does not match this request\n")
             continue                      # late reply to an earlier request / unrelated
+        if verbose:
+            dump("<<< Response received", data.decode("utf-8", errors="replace"))
         if status < 200:
             continue                      # provisional (100 Trying etc.), wait for final
         return status, reason
 
 
-async def send_options_request(sock, host, port, timeout, lan_ip, seq):
+async def send_options_request(sock, host, port, timeout, lan_ip, seq, verbose=False):
     try:
         branch = uuid.uuid4().hex[:16]
         cseq = str(seq)
@@ -175,7 +191,7 @@ async def send_options_request(sock, host, port, timeout, lan_ip, seq):
 
         try:
             status, reason = await asyncio.wait_for(
-                send_and_receive(sock, request, CALL_ID, cseq, branch),
+                send_and_receive(sock, request, CALL_ID, cseq, branch, verbose),
                 timeout=timeout
             )
         except asyncio.TimeoutError:
@@ -206,6 +222,7 @@ async def main():
     parser.add_argument("-c", "--count", type=int, default=5)
     parser.add_argument("-t", "--timeout", type=float, default=3)
     parser.add_argument("-i", "--interval", type=float, default=REQUEST_INTERVAL)
+    parser.add_argument("-v", "--verbose", action="store_true", help="print full request and response messages")
 
     args = parser.parse_args()
 
@@ -244,7 +261,7 @@ async def main():
     try:
         for seq in range(1, num_requests + 1):
             start = time.monotonic()
-            rtt = await send_options_request(sock, host, port, timeout, lan_ip, seq)
+            rtt = await send_options_request(sock, host, port, timeout, lan_ip, seq, args.verbose)
 
             sent += 1
             if rtt is not None:
