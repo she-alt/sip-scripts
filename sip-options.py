@@ -5,6 +5,7 @@ import uuid
 import sys
 import argparse
 import signal
+import statistics
 
 ###
 '''
@@ -18,6 +19,14 @@ SIP_PORT = 5060
 
 # Request interval, time to wait between requests
 REQUEST_INTERVAL = 1
+
+# Percentiles are only printed with at least this many replies (meaningless on tiny samples)
+PERCENTILE_MIN_SAMPLES = 20
+
+# Exit codes for use in monitoring
+EXIT_OK = 0       # every request got a reply
+EXIT_LOSS = 1     # at least one request got no reply
+EXIT_ERROR = 2    # could not run: bad arguments, DNS failure, socket error
 
 # One Call-ID for the whole run; CSeq increments per request (RFC 3261 style keepalive)
 CALL_ID = str(uuid.uuid4())
@@ -215,6 +224,7 @@ async def send_options_request(sock, host, port, timeout, lan_ip, seq, verbose=F
 async def main():
     parser = argparse.ArgumentParser(
         description="Sends UDP SIP options to an endpoint and shows DNS resolution time, round-trip-time and packet loss percentage ",
+        epilog="Exit codes: 0 = all replies received, 1 = packet loss, 2 = error",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("destination", help="SIP server IP/hostname, optionally host:port")
@@ -234,20 +244,24 @@ async def main():
     num_requests = args.count
     timeout = args.timeout
 
-    lan_ip = get_local_ip()
+    try:
+        lan_ip = get_local_ip()
+    except OSError as e:
+        print(f"Could not determine local IP: {e}")
+        return EXIT_ERROR
 
     # DNS resolution
     ip, dns_time = resolve_target(host)
 
     if ip is None:
         print("DNS resolution failed")
-        return
+        return EXIT_ERROR
 
     try:
         sock = create_socket(ip, port)
     except OSError as e:
         print(f"Socket error: {e}")
-        return
+        return EXIT_ERROR
 
     print(f"\nSending SIP Option to: {host} ({ip}), port {port}")
     print(f"DNS resolution time: {dns_time:.2f} ms")
@@ -290,21 +304,34 @@ async def main():
 
         print(f"rtt min/avg/max: {min(rtt_list):.2f}/{avg:.2f}/{max(rtt_list):.2f} ms")
 
-        print(
-            f"percentiles p50/p95/p99: "
-            f"{percentile(rtt_list,50):.2f}/"
-            f"{percentile(rtt_list,95):.2f}/"
-            f"{percentile(rtt_list,99):.2f} ms"
-        )
+        if len(rtt_list) >= 2:
+            stddev = statistics.stdev(rtt_list)
+            # jitter = mean absolute difference between consecutive RTTs
+            jitter = sum(abs(b - a) for a, b in zip(rtt_list, rtt_list[1:])) / (len(rtt_list) - 1)
+            print(f"stddev: {stddev:.2f} ms, jitter: {jitter:.2f} ms")
+
+        if len(rtt_list) >= PERCENTILE_MIN_SAMPLES:
+            print(
+                f"percentiles p50/p95/p99: "
+                f"{percentile(rtt_list,50):.2f}/"
+                f"{percentile(rtt_list,95):.2f}/"
+                f"{percentile(rtt_list,99):.2f} ms"
+            )
     else:
         print("No successful responses")
+
+    return EXIT_OK if sent and received == sent else EXIT_LOSS
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        sys.exit(asyncio.run(main()))
     except KeyboardInterrupt:
         print("\nInterrupted by user")
+        sys.exit(EXIT_LOSS)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(EXIT_ERROR)
         
  
 #
@@ -319,4 +346,5 @@ if __name__ == "__main__":
 # https://docs.python.org/3/library/uuid.html
 # https://docs.python.org/3/library/time.html#time.monotonic
 # https://docs.python.org/3/library/argparse.html#module-argparse
+# https://docs.python.org/3.12/library/statistics.html
 # 
